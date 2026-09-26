@@ -3,6 +3,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -1432,10 +1433,11 @@ func TestNewGPUManagerPriorityMixedCollectors(t *testing.T) {
 
 	intelPath := filepath.Join(dir, "intel_gpu_top")
 	intelScript := `#!/bin/sh
-echo "Freq MHz      IRQ RC6     Power W     IMC MiB/s             RCS             VCS"
-echo " req  act       /s   %   gpu   pkg     rd     wr       %  se  wa       %  se  wa"
-echo "226  223      338  58  2.00  2.69   1820    965   0.00    0   0    0.00   0   0"
-echo "189  187      412  67  1.80  2.45   1950    823   8.50    2   1    15.00   1   0"
+echo '['
+echo '{"period":3.3,"frequency":226,"interrupts":338,"rc6":58,"power":{"GPU":2.0,"Package":2.69,"unit":"W"},"engines":{"RCS":{"busy":0.0,"sema":0,"wait":0,"unit":"%"},"VCS":{"busy":0.0,"sema":0,"wait":0,"unit":"%"}}}'
+echo ','
+echo '{"period":3.3,"frequency":189,"interrupts":412,"rc6":67,"power":{"GPU":1.8,"Package":2.45,"unit":"W"},"engines":{"RCS":{"busy":8.5,"sema":2,"wait":1,"unit":"%"},"VCS":{"busy":15.0,"sema":1,"wait":0,"unit":"%"}}}'
+echo ']'
 `
 	require.NoError(t, os.WriteFile(intelPath, []byte(intelScript), 0755))
 
@@ -1756,15 +1758,18 @@ func TestIntelCollectorStreaming(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PATH", dir)
 
-	// Create a fake intel_gpu_top that prints -l format with four samples (first will be skipped) and exits
+	// Create a fake intel_gpu_top that prints -J (JSON) output with three
+	// samples (first will be skipped) and exits. Sample 3 omits the power
+	// section to prove it is optional.
 	scriptPath := filepath.Join(dir, "intel_gpu_top")
 	script := `#!/bin/sh
-echo "Freq MHz      IRQ RC6     Power W     IMC MiB/s             RCS             BCS             VCS"
-echo " req  act       /s   %   gpu   pkg     rd     wr       %  se  wa       %  se  wa       %  se  wa"
-echo "373  373      224  45  1.50  4.13   2554    714   12.34   0   0    0.00   0   0    5.00   0   0"
-echo "226  223      338  58  2.00  2.69   1820    965   0.00    0   0    0.00   0   0    0.00   0   0"
-echo "189  187      412  67  1.80  2.45   1950    823   8.50    2   1    15.00   1   0    22.00  0   1"
-echo "298  295      278  51  2.20  3.12   1675    942   5.75    1   2    9.50    3   1    12.00  1   0"`
+echo '['
+echo '{"period":{"duration":3300,"unit":"ms"},"frequency":{"requested":1350,"actual":1300,"unit":"MHz"},"interrupts":{"count":120,"unit":"irq/s"},"rc6":{"value":55,"unit":"%"},"power":{"GPU":1.0,"Package":2.0,"unit":"W"},"engines":{"RCS":{"busy":10.0,"sema":0,"wait":0,"unit":"%"},"VCS":{"busy":4.0,"sema":0,"wait":0,"unit":"%"}}}'
+echo ','
+echo '{"power":{"GPU":2.0,"Package":1.8,"unit":"W"},"engines":{"RCS":{"busy":12.25,"sema":0,"wait":0,"unit":"%"},"VCS":{"busy":12.0,"sema":0,"wait":0,"unit":"%"},"VECS":{"busy":5.5,"sema":0,"wait":0,"unit":"%"}}}'
+echo ','
+echo '{"engines":{"RCS":{"busy":5.75,"sema":0,"wait":0,"unit":"%"},"VCS":{"busy":12.0,"sema":0,"wait":0,"unit":"%"},"CCS":{"busy":3.0,"sema":0,"wait":0,"unit":"%"}}}'
+echo ']'`
 	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -1773,236 +1778,102 @@ echo "298  295      278  51  2.20  3.12   1675    942   5.75    1   2    9.50   
 		GpuDataMap: make(map[string]*system.GPUData),
 	}
 
-	// Run the collector once; it should read four samples but skip the first and return
+	// Run the collector once; it should read three samples but skip the first and return
 	if err := gm.collectIntelStats(); err != nil {
 		t.Fatalf("collectIntelStats error: %v", err)
 	}
 
 	gpu := gm.GpuDataMap["i0"]
 	require.NotNil(t, gpu)
-	// Power should be sum of samples 2-4 (first is skipped): 2.0 + 1.8 + 2.2 = 6.0
-	assert.EqualValues(t, 6.0, gpu.Power)
-	assert.InDelta(t, 8.26, gpu.PowerPkg, 0.01) // Allow small floating point differences
-	// Engines aggregated from samples 2-4
-	assert.EqualValues(t, 14.25, gpu.Engines["Render/3D"]) // 0.00 + 8.50 + 5.75
-	assert.EqualValues(t, 34.0, gpu.Engines["Video"])      // 0.00 + 22.00 + 12.00
-	assert.EqualValues(t, 24.5, gpu.Engines["Blitter"])    // 0.00 + 15.00 + 9.50
-	// Count should be 3 samples (first is skipped)
-	assert.Equal(t, float64(3), gpu.Count)
+	// Power should be from sample 2 only (first skipped, third has no power)
+	assert.EqualValues(t, 2.0, gpu.Power)
+	assert.EqualValues(t, 1.8, gpu.PowerPkg)
+	// Engines aggregated from samples 2-3
+	assert.EqualValues(t, 18.0, gpu.Engines["Render/3D"])  // 12.25 + 5.75
+	assert.EqualValues(t, 24.0, gpu.Engines["Video"])      // 12.0 + 12.0
+	assert.EqualValues(t, 5.5, gpu.Engines["VideoEnhance"]) // 5.5
+	assert.EqualValues(t, 3.0, gpu.Engines["Compute"])      // 3.0
+	// Count should be 2 samples (first is skipped)
+	assert.Equal(t, float64(2), gpu.Count)
 }
 
-func TestParseIntelHeaders(t *testing.T) {
+func TestParseIntelJSONSample(t *testing.T) {
 	tests := []struct {
-		name              string
-		header1           string
-		header2           string
-		wantEngineNames   []string
-		wantFriendlyNames []string
-		wantPowerIndex    int
-		wantPreEngineCols int
+		name      string
+		input     string
+		wantStats intelGpuStats
+		wantErr   bool
 	}{
 		{
-			name:              "basic headers with RCS BCS VCS",
-			header1:           "Freq MHz      IRQ RC6     Power W     IMC MiB/s             RCS             BCS             VCS",
-			header2:           " req  act       /s   %   gpu   pkg     rd     wr       %  se  wa       %  se  wa       %  se  wa",
-			wantEngineNames:   []string{"RCS", "BCS", "VCS"},
-			wantFriendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			wantPowerIndex:    4, // "gpu" is at index 4
-			wantPreEngineCols: 8, // 17 total cols - 3*3 = 8
+			name: "full sample with power and all engines",
+			input: `{"period":{"duration":3300,"unit":"ms"},"frequency":{"requested":1350,"actual":1300,"unit":"MHz"},"interrupts":{"count":123,"unit":"irq/s"},"rc6":{"value":55,"unit":"%"},"power":{"GPU":6.0,"Package":8.26,"unit":"W"},"engines":{"RCS":{"busy":12.34,"sema":0,"wait":0,"unit":"%"},"BCS":{"busy":1.00,"sema":0,"wait":0,"unit":"%"},"VCS":{"busy":5.00,"sema":0,"wait":0,"unit":"%"},"VECS":{"busy":3.5,"sema":0,"wait":0,"unit":"%"},"CCS":{"busy":2.5,"sema":0,"wait":0,"unit":"%"}},"clients":{"1234":{"pid":999,"name":"firefox"}}}`,
+			wantStats: intelGpuStats{
+				PowerGPU: 6.0,
+				PowerPkg: 8.26,
+				Engines: map[string]float64{
+					"Render/3D":    12.34,
+					"Blitter":      1.00,
+					"Video":        5.00,
+					"VideoEnhance": 3.5,
+					"Compute":      2.5,
+				},
+			},
 		},
 		{
-			name:              "basic headers with RCS BCS VCS using index in name",
-			header1:           "Freq MHz      IRQ RC6     Power W     IMC MiB/s           RCS/0           BCS/1           VCS/2",
-			header2:           " req  act       /s   %   gpu   pkg     rd     wr       %  se  wa       %  se  wa       %  se  wa",
-			wantEngineNames:   []string{"RCS", "BCS", "VCS"},
-			wantFriendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			wantPowerIndex:    4, // "gpu" is at index 4
-			wantPreEngineCols: 8, // 17 total cols - 3*3 = 8
+			name:  "sample without power section",
+			input: `{"engines":{"RCS":{"busy":10.0,"unit":"%"},"VCS":{"busy":4.0,"unit":"%"}}}`,
+			wantStats: intelGpuStats{
+				Engines: map[string]float64{
+					"Render/3D": 10.0,
+					"Video":     4.0,
+				},
+			},
 		},
 		{
-			name:              "headers with only RCS",
-			header1:           "Freq MHz      IRQ RC6     Power W     IMC MiB/s             RCS",
-			header2:           " req  act       /s   %   gpu   pkg     rd     wr       %  se  wa",
-			wantEngineNames:   []string{"RCS"},
-			wantFriendlyNames: []string{"Render/3D"},
-			wantPowerIndex:    4,
-			wantPreEngineCols: 8, // 11 total - 3*1 = 8
+			name:  "physical engine keys with instance suffix",
+			input: `{"engines":{"RCS/0":{"busy":7.5,"unit":"%"},"VCS/0":{"busy":1.5,"unit":"%"},"VCS/1":{"busy":2.5,"unit":"%"}}}`,
+			wantStats: intelGpuStats{
+				Engines: map[string]float64{
+					"Render/3D": 7.5,
+					"Video":     4.0,
+				},
+			},
 		},
 		{
-			name:              "headers with VECS and CCS",
-			header1:           "Freq MHz      IRQ RC6     Power W     IMC MiB/s             VECS            CCS",
-			header2:           " req  act       /s   %   gpu   pkg     rd     wr       %  se  wa     %  se  wa",
-			wantEngineNames:   []string{"VECS", "CCS"},
-			wantFriendlyNames: []string{"VideoEnhance", "Compute"},
-			wantPowerIndex:    4,
-			wantPreEngineCols: 8, // 14 total - 3*2 = 8
+			name:  "unknown engine key kept as-is",
+			input: `{"engines":{"RCS":{"busy":1.0,"unit":"%"},"MSM":{"busy":9.0,"unit":"%"}}}`,
+			wantStats: intelGpuStats{
+				Engines: map[string]float64{
+					"Render/3D": 1.0,
+					"MSM":       9.0,
+				},
+			},
 		},
 		{
-			name:              "no engines",
-			header1:           "Freq MHz      IRQ RC6     Power W     IMC MiB/s",
-			header2:           " req  act       /s   %   gpu   pkg     rd     wr",
-			wantEngineNames:   nil, // no engines found, slices remain nil
-			wantFriendlyNames: nil,
-			wantPowerIndex:    -1, // no engines, so no search
-			wantPreEngineCols: 0,
+			name:      "sample with no engines",
+			input:     `{"period":{"duration":3300,"unit":"ms"},"power":{"GPU":1.0,"Package":2.0,"unit":"W"}}`,
+			wantStats: intelGpuStats{PowerGPU: 1.0, PowerPkg: 2.0},
 		},
 		{
-			name:              "power index not found",
-			header1:           "Freq MHz      IRQ RC6     Power W     IMC MiB/s             RCS",
-			header2:           " req  act       /s   %   pkg   cpu     rd     wr       %  se  wa", // no "gpu"
-			wantEngineNames:   []string{"RCS"},
-			wantFriendlyNames: []string{"Render/3D"},
-			wantPowerIndex:    -1, // "gpu" not found
-			wantPreEngineCols: 8,  // 11 total - 3*1 = 8
-		},
-		{
-			name:              "empty headers",
-			header1:           "",
-			header2:           "",
-			wantEngineNames:   nil, // empty input, slices remain nil
-			wantFriendlyNames: nil,
-			wantPowerIndex:    -1,
-			wantPreEngineCols: 0,
+			name:    "garbage input",
+			input:   `this is not json`,
+			wantErr: true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gm := &GPUManager{}
-			engineNames, friendlyNames, powerIndex, preEngineCols := gm.parseIntelHeaders(tt.header1, tt.header2)
-
-			assert.Equal(t, tt.wantEngineNames, engineNames)
-			assert.Equal(t, tt.wantFriendlyNames, friendlyNames)
-			assert.Equal(t, tt.wantPowerIndex, powerIndex)
-			assert.Equal(t, tt.wantPreEngineCols, preEngineCols)
-		})
-	}
-}
-
-func TestParseIntelData(t *testing.T) {
-	tests := []struct {
-		name          string
-		line          string
-		engineNames   []string
-		friendlyNames []string
-		powerIndex    int
-		preEngineCols int
-		wantPowerGPU  float64
-		wantEngines   map[string]float64
-		wantErr       error
-	}{
-		{
-			name:          "basic data with power and engines",
-			line:          "373  373      224  45  1.50  4.13   2554    714   12.34   0   0    0.00   0   0    5.00   0   0",
-			engineNames:   []string{"RCS", "BCS", "VCS"},
-			friendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  1.50,
-			wantEngines: map[string]float64{
-				"Render/3D": 12.34,
-				"Blitter":   0.00,
-				"Video":     5.00,
-			},
-		},
-		{
-			name:          "data with zero power",
-			line:          "226  223      338  58  0.00  2.69   1820    965   0.00    0   0    0.00   0   0    0.00   0   0",
-			engineNames:   []string{"RCS", "BCS", "VCS"},
-			friendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  0.00,
-			wantEngines: map[string]float64{
-				"Render/3D": 0.00,
-				"Blitter":   0.00,
-				"Video":     0.00,
-			},
-		},
-		{
-			name:          "data with no power index",
-			line:          "373  373      224  45  1.50  4.13   2554    714   12.34   0   0    0.00   0   0    5.00   0   0",
-			engineNames:   []string{"RCS", "BCS", "VCS"},
-			friendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			powerIndex:    -1,
-			preEngineCols: 8,
-			wantPowerGPU:  0.0, // no power parsed
-			wantEngines: map[string]float64{
-				"Render/3D": 12.34,
-				"Blitter":   0.00,
-				"Video":     5.00,
-			},
-		},
-		{
-			name:          "data with insufficient columns",
-			line:          "373  373      224  45  1.50", // too few columns
-			engineNames:   []string{"RCS", "BCS", "VCS"},
-			friendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  0.0,
-			wantEngines:   nil, // empty sample returned
-			wantErr:       errNoValidData,
-		},
-		{
-			name:          "empty line",
-			line:          "",
-			engineNames:   []string{"RCS"},
-			friendlyNames: []string{"Render/3D"},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  0.0,
-			wantEngines:   nil,
-			wantErr:       errNoValidData,
-		},
-		{
-			name:          "data with invalid power value",
-			line:          "373  373      224  45  N/A  4.13   2554    714   12.34   0   0    0.00   0   0    5.00   0   0",
-			engineNames:   []string{"RCS", "BCS", "VCS"},
-			friendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  0.0, // N/A can't be parsed
-			wantEngines: map[string]float64{
-				"Render/3D": 12.34,
-				"Blitter":   0.00,
-				"Video":     5.00,
-			},
-		},
-		{
-			name:          "data with invalid engine value",
-			line:          "373  373      224  45  1.50  4.13   2554    714   N/A     0   0    0.00   0   0    5.00   0   0",
-			engineNames:   []string{"RCS", "BCS", "VCS"},
-			friendlyNames: []string{"Render/3D", "Blitter", "Video"},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  1.50,
-			wantEngines: map[string]float64{
-				"Render/3D": 0.0, // N/A becomes 0
-				"Blitter":   0.00,
-				"Video":     5.00,
-			},
-		},
-		{
-			name:          "data with no engines",
-			line:          "373  373      224  45  1.50  4.13   2554    714",
-			engineNames:   []string{},
-			friendlyNames: []string{},
-			powerIndex:    4,
-			preEngineCols: 8,
-			wantPowerGPU:  1.50,
-			wantEngines:   nil,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			gm := &GPUManager{}
-			sample, err := gm.parseIntelData(tt.line, tt.engineNames, tt.friendlyNames, tt.powerIndex, tt.preEngineCols)
-			assert.Equal(t, tt.wantErr, err)
-
-			assert.Equal(t, tt.wantPowerGPU, sample.PowerGPU)
-			assert.Equal(t, tt.wantEngines, sample.Engines)
+			var sample intelGpuJSONSample
+			if err := json.Unmarshal([]byte(tt.input), &sample); (err != nil) != tt.wantErr {
+				t.Fatalf("unmarshal error = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			got := parseIntelJSONSample(sample)
+			assert.Equal(t, tt.wantStats.PowerGPU, got.PowerGPU)
+			assert.Equal(t, tt.wantStats.PowerPkg, got.PowerPkg)
+			assert.Equal(t, tt.wantStats.Engines, got.Engines)
 		})
 	}
 }
@@ -2014,14 +1885,16 @@ func TestIntelCollectorDeviceEnv(t *testing.T) {
 	// Prepare a file to capture args
 	argsFile := filepath.Join(dir, "args.txt")
 
-	// Create a fake intel_gpu_top that records its arguments and prints minimal valid output
+	// Create a fake intel_gpu_top that records its arguments and prints a
+	// minimal valid JSON output
 	scriptPath := filepath.Join(dir, "intel_gpu_top")
 	script := fmt.Sprintf(`#!/bin/sh
 echo "$@" > %s
-echo "Freq MHz      IRQ RC6     Power W     IMC MiB/s             RCS             VCS"
-echo " req  act       /s   %%   gpu   pkg     rd     wr       %%  se  wa       %%  se  wa"
-echo "226  223      338  58  2.00  2.69   1820    965   0.00    0   0    0.00   0   0"
-echo "189  187      412  67  1.80  2.45   1950    823   8.50    2   1    15.00   1   0"
+echo '['
+echo '{"power":{"GPU":2.0,"Package":2.7,"unit":"W"},"engines":{"RCS":{"busy":0.0,"sema":0,"wait":0,"unit":"%%"},"VCS":{"busy":0.0,"sema":0,"wait":0,"unit":"%%"}}}'
+echo ','
+echo '{"power":{"GPU":1.8,"Package":2.4,"unit":"W"},"engines":{"RCS":{"busy":8.5,"sema":0,"wait":0,"unit":"%%"},"VCS":{"busy":15.0,"sema":0,"wait":0,"unit":"%%"}}}'
+echo ']'
 `, argsFile)
 	if err := os.WriteFile(scriptPath, []byte(script), 0755); err != nil {
 		t.Fatal(err)
@@ -2043,5 +1916,5 @@ echo "189  187      412  67  1.80  2.45   1950    823   8.50    2   1    15.00  
 	argsStr := strings.TrimSpace(string(data))
 	require.Contains(t, argsStr, "-d sriov")
 	require.Contains(t, argsStr, "-s ")
-	require.Contains(t, argsStr, "-l")
+	require.Contains(t, argsStr, "-J")
 }
